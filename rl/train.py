@@ -36,9 +36,12 @@ from sac import SAC_Trainer, sac_worker, ShareParameters
 from sac import ReplayBuffer, RewardBuffer
 from utils import create_folder
 
+import sys
 import torch
 
-torch.multiprocessing.set_start_method('forkserver', force=True)
+# Windows only supports 'spawn'; 'forkserver' / 'fork' are POSIX-only.
+_mp_start_method = 'spawn' if sys.platform == 'win32' else 'forkserver'
+torch.multiprocessing.set_start_method(_mp_start_method, force=True)
 
 
 def arg_parser():

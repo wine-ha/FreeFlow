@@ -21,7 +21,7 @@
         "ls_max_iter": 50,
         "ls_beta": 0.3,
         "ls_alpha": 0.0001,
-        "linear_solver_type": "cuda_lu",
+        "linear_solver_type": "cuda_qr",
         "grad_check": false,
         "substeps": 3,
         "vbd_iterations": 30,
