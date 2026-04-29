@@ -79,7 +79,7 @@ export VCPKG_ROOTCMAKE_TOOLCHAIN_FILE=$path/to/your/vcpkg/scripts/buildsystems/v
 ### Step 3: Build with python bindings
 
 ```bash
-conda create -n fsi python=3.10
+conda create -n fsi python=3.12
 conda activate fsi
 pip install -r requirements.txt
 pip install -e . -v

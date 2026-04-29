@@ -20,14 +20,24 @@ namespace fsi
     namespace NumericUtils
     {
 
+        /**
+         * @brief Per-type epsilon used for approximate comparisons.
+         *
+         * Implemented as a constexpr function template (instead of a
+         * __device__ variable template) because nvcc on Windows does not
+         * allow a const-qualified __device__ variable template.
+         */
         template <typename T>
-        static inline constexpr __device__ T Epsilon = std::is_same_v<T, float> ? 1e-6f : 1e-9;
+        [[nodiscard]] __host__ __device__ inline constexpr T Epsilon()
+        {
+            return std::is_same_v<T, float> ? static_cast<T>(1e-6f) : static_cast<T>(1e-9);
+        }
 
         /**
          * @brief check if a is approximately equal to b  (|a - b| <= epsilon)
          */
         template <typename T>
-        [[nodiscard]] __host__ __device__ inline bool isApproxEqual(T a, T b, T epsilon = Epsilon<T>)
+        [[nodiscard]] __host__ __device__ inline bool isApproxEqual(T a, T b, T epsilon = Epsilon<T>())
         {
             return std::abs(a - b) <= epsilon;
         }
@@ -36,7 +46,7 @@ namespace fsi
          * @brief check if a is approximately zero (|a| <= epsilon)
          */
         template <typename T>
-        [[nodiscard]] __host__ __device__ inline bool isApproxZero(T a, T epsilon = Epsilon<T>)
+        [[nodiscard]] __host__ __device__ inline bool isApproxZero(T a, T epsilon = Epsilon<T>())
         {
             return std::abs(a) <= epsilon;
         }
@@ -45,7 +55,7 @@ namespace fsi
          * @brief check if a is approximately less than b (a < b - epsilon)
          */
         template <typename T>
-        [[nodiscard]] __host__ __device__ inline bool isApproxLess(T a, T b, T epsilon = Epsilon<T>)
+        [[nodiscard]] __host__ __device__ inline bool isApproxLess(T a, T b, T epsilon = Epsilon<T>())
         {
             return a < b - epsilon;
         }
@@ -54,7 +64,7 @@ namespace fsi
          * @brief check if a is approximately less than or equal to b (a <= b + epsilon)
          */
         template <typename T>
-        [[nodiscard]] __host__ __device__ inline bool isApproxLessEqual(T a, T b, T epsilon = Epsilon<T>)
+        [[nodiscard]] __host__ __device__ inline bool isApproxLessEqual(T a, T b, T epsilon = Epsilon<T>())
         {
             return a <= b + epsilon;
         }
@@ -63,7 +73,7 @@ namespace fsi
          * @brief check if a is approximately greater than b (a > b + epsilon)
          */
         template <typename T>
-        [[nodiscard]] __host__ __device__ inline bool isApproxGreater(T a, T b, T epsilon = Epsilon<T>)
+        [[nodiscard]] __host__ __device__ inline bool isApproxGreater(T a, T b, T epsilon = Epsilon<T>())
         {
             return a > b + epsilon;
         }
@@ -72,7 +82,7 @@ namespace fsi
          * @brief check if a is approximately greater than or equal to b (a >= b - epsilon)
          */
         template <typename T>
-        [[nodiscard]] __host__ __device__ inline bool isApproxGreaterEqual(T a, T b, T epsilon = Epsilon<T>)
+        [[nodiscard]] __host__ __device__ inline bool isApproxGreaterEqual(T a, T b, T epsilon = Epsilon<T>())
         {
             return a >= b - epsilon;
         }
@@ -84,8 +94,8 @@ namespace fsi
          */
         template <typename T>
         [[nodiscard]] __host__ __device__ inline bool isAlmostLessEqual(T a, T b,
-                                                                        T abs_epsilon = Epsilon<T>,
-                                                                        T rel_epsilon = Epsilon<T>)
+                                                                        T abs_epsilon = Epsilon<T>(),
+                                                                        T rel_epsilon = Epsilon<T>())
         {
             if (a <= b)
                 return true;

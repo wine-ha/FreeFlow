@@ -12,3 +12,19 @@ cmake.source-dir = "."
 build-dir = "build"
 
 install.components = ["python_module"]
+
+cmake.build-type = "Release"
+
+cmake.args = [
+    "-G", "Visual Studio 17 2022",
+]
+
+[tool.scikit-build.cmake.define]
+CMAKE_TOOLCHAIN_FILE = "C:/vcpkg/scripts/buildsystems/vcpkg.cmake"
+VCPKG_OVERLAY_PORTS = ""
+CMAKE_DISABLE_FIND_PACKAGE_Python3 = "TRUE"
+Python_FIND_VIRTUALENV = "ONLY"
+Python_FIND_STRATEGY = "LOCATION"
+Python_FIND_REGISTRY = "NEVER"
+Python_FIND_FRAMEWORK = "NEVER"
+VCPKG_POLICY_SKIP_DUMPBIN_CHECKS = "enabled"

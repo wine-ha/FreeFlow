@@ -492,21 +492,32 @@ __device__ void LbmUtilsFuncGpu2D::CalculateDistributionD2Q9ALL(
     float Q_xyy = calc_Q(piyy, ux, pixy, uy);
     float bulk = rho - 0.5f * (m2_xx + m2_yy);
 
-    float *w = LbmD2Q9::c_w; // assuming access
+    // NOTE: LbmD2Q9::c_w is __constant__ memory; taking its address with a
+    // plain float* is not allowed in device code under newer CUDA toolchains.
+    // Read each weight by subscript directly instead.
+    float w0 = LbmD2Q9::c_w[0];
+    float w1 = LbmD2Q9::c_w[1];
+    float w2 = LbmD2Q9::c_w[2];
+    float w3 = LbmD2Q9::c_w[3];
+    float w4 = LbmD2Q9::c_w[4];
+    float w5 = LbmD2Q9::c_w[5];
+    float w6 = LbmD2Q9::c_w[6];
+    float w7 = LbmD2Q9::c_w[7];
+    float w8 = LbmD2Q9::c_w[8];
 
-    f_out[0] = w[0] * bulk;
-    f_out[1] = w[1] * (bulk + m1_x + 1.5f * m2_xx - 0.5 * Q_xyy);
-    f_out[2] = w[2] * (bulk + m1_y + 1.5f * m2_yy - 0.5 * Q_xxy);
-    f_out[3] = w[3] * (bulk - m1_x + 1.5f * m2_xx + 0.5 * Q_xyy);
-    f_out[4] = w[4] * (bulk - m1_y + 1.5f * m2_yy + 0.5 * Q_xxy);
-    
-    // float diag_common = bulk + m2_xx + m2_yy; 
+    f_out[0] = w0 * bulk;
+    f_out[1] = w1 * (bulk + m1_x + 1.5f * m2_xx - 0.5f * Q_xyy);
+    f_out[2] = w2 * (bulk + m1_y + 1.5f * m2_yy - 0.5f * Q_xxy);
+    f_out[3] = w3 * (bulk - m1_x + 1.5f * m2_xx + 0.5f * Q_xyy);
+    f_out[4] = w4 * (bulk - m1_y + 1.5f * m2_yy + 0.5f * Q_xxy);
+
+    // float diag_common = bulk + m2_xx + m2_yy;
     float diag_base = bulk + 1.5f * (m2_xx + m2_yy);
-    
-    f_out[5] = w[5] * (diag_base + (m1_x + m1_y) + m2_xy + (Q_xxy + Q_xyy));
-    f_out[6] = w[6] * (diag_base - m1_x + m1_y - m2_xy + Q_xxy - Q_xyy);
-    f_out[7] = w[7] * (diag_base - m1_x - m1_y + m2_xy - Q_xxy - Q_xyy);
-    f_out[8] = w[8] * (diag_base + m1_x - m1_y - m2_xy - Q_xxy + Q_xyy);
+
+    f_out[5] = w5 * (diag_base + (m1_x + m1_y) + m2_xy + (Q_xxy + Q_xyy));
+    f_out[6] = w6 * (diag_base - m1_x + m1_y - m2_xy + Q_xxy - Q_xyy);
+    f_out[7] = w7 * (diag_base - m1_x - m1_y + m2_xy - Q_xxy - Q_xyy);
+    f_out[8] = w8 * (diag_base + m1_x - m1_y - m2_xy - Q_xxy + Q_xyy);
 }
 
 __device__ void LbmUtilsFuncGpu2D::Collision(

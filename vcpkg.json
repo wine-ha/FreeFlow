@@ -10,12 +10,16 @@
     "tinyobjloader",
     "vtk",
     "glm",
+    "fmt",
     {
       "name": "suitesparse-cholmod",
       "features": [
-        "cuda",
         "openmp"
       ]
     }
+  ],
+  "overrides": [
+    { "name": "fmt", "version": "10.2.1" },
+    { "name": "spdlog", "version": "1.14.1" }
   ]
 }
