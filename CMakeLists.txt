@@ -285,20 +285,124 @@ if(PYTHON_BINDINGS)
         pybind11::module
     )
 
+    # 注意：DESTINATION 必须是 'fsi_simulator'（包名子目录），
+    # 而不是 '.'（site-packages 根目录）。
+    # 如果装到根目录，Python 会把 fsi_simulator.pyd 识别为单文件模块，
+    # 忽略同目录下的 __init__.py（submodule_search_locations=None），
+    # 导致 __init__.py 里的 os.add_dll_directory() 从不执行，
+    # 进而报 ImportError: DLL load failed。
+    # 装到 fsi_simulator/ 子目录后，才会形成真正的 package：
+    #   site-packages/fsi_simulator/__init__.py   <- 先执行，注册 DLL 路径
+    #   site-packages/fsi_simulator/fsi_simulator.cp312-win_amd64.pyd
     install(TARGETS fsi_simulator
             LIBRARY  # 表示这是一个库文件
-            DESTINATION . # 安装到包的根目录
+            DESTINATION fsi_simulator # 安装到 package 子目录
             COMPONENT python_module # 匹配 pyproject.toml 中的组件名
     )
     
     # 2. 创建并安装 __init__.py 文件
     # 这样做可以让用户直接 `import fsi_simulator`
-    # 并从.so文件中导入所有内容
-    set(INIT_PY_CONTENT "from .fsi_simulator import *")
-    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/__init__.py" "${INIT_PY_CONTENT}")
-    
+    # 并从.pyd/.so文件中导入所有内容
+    #
+    # Windows 特别说明：Python 3.8+ 在 Windows 上加载 .pyd 时，不再使用 PATH
+    # 环境变量解析依赖 DLL，必须用 os.add_dll_directory() 显式注册目录。
+    #
+    # 我们在 CMake 配置期就把以下绝对路径烧进 __init__.py（而不是运行时再去猜）：
+    #   1) 本次构建使用的 vcpkg_installed/x64-windows/bin（fmt/spdlog/vtk/hdf5 等）
+    #   2) 本次构建使用的 CUDAToolkit 的 bin 目录（cudart/cusparse/cusolver 等）
+    # 原因：editable install 下 .pyd 被装到 site-packages/fsi_simulator/，而依赖
+    # 的 DLL 仍留在原 build 目录里，二者不在同一条路径上，靠 __file__ 向上遍历
+    # 找不到 vcpkg_installed。把绝对路径烧进 __init__.py 是最可靠的办法。
+    #
+    # 此外仍保留：
+    #   - 运行时对 CUDA_PATH 环境变量的探测（换机器/换 CUDA 版本时兜底）
+    #   - FSI_EXTRA_DLL_DIRS（用户附加目录，os.pathsep 分隔）
+    # Linux/macOS 上整段逻辑自动跳过，不会产生任何影响。
+
+    # 解析本次构建使用的 vcpkg bin 目录
+    set(_FSI_VCPKG_BIN_DIR "")
+    if(DEFINED VCPKG_INSTALLED_DIR)
+        set(_FSI_VCPKG_BIN_DIR "${VCPKG_INSTALLED_DIR}/x64-windows/bin")
+    elseif(EXISTS "${CMAKE_BINARY_DIR}/vcpkg_installed/x64-windows/bin")
+        set(_FSI_VCPKG_BIN_DIR "${CMAKE_BINARY_DIR}/vcpkg_installed/x64-windows/bin")
+    elseif(EXISTS "${PROJECT_SOURCE_DIR}/build/vcpkg_installed/x64-windows/bin")
+        set(_FSI_VCPKG_BIN_DIR "${PROJECT_SOURCE_DIR}/build/vcpkg_installed/x64-windows/bin")
+    endif()
+    # 规范成正斜杠，避免写入 Python 字符串时反斜杠转义问题
+    if(_FSI_VCPKG_BIN_DIR)
+        file(TO_CMAKE_PATH "${_FSI_VCPKG_BIN_DIR}" _FSI_VCPKG_BIN_DIR)
+    endif()
+    message(STATUS "Baking vcpkg bin dir into __init__.py: ${_FSI_VCPKG_BIN_DIR}")
+
+    # 解析 CUDAToolkit 的 bin 目录
+    set(_FSI_CUDA_BIN_DIR "")
+    if(DEFINED CUDAToolkit_BIN_DIR)
+        set(_FSI_CUDA_BIN_DIR "${CUDAToolkit_BIN_DIR}")
+    elseif(DEFINED CUDAToolkit_ROOT)
+        set(_FSI_CUDA_BIN_DIR "${CUDAToolkit_ROOT}/bin")
+    endif()
+    if(_FSI_CUDA_BIN_DIR)
+        file(TO_CMAKE_PATH "${_FSI_CUDA_BIN_DIR}" _FSI_CUDA_BIN_DIR)
+    endif()
+    message(STATUS "Baking CUDA bin dir into __init__.py: ${_FSI_CUDA_BIN_DIR}")
+
+    # 用 configure_file 把上面两个变量替换进模板
+    # 注意：这里用 @ONLY 以避免与 Python 的 ${...} 语法冲突
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/__init__.py.in"
+"\"\"\"fsi_simulator package init.\"\"\"
+import os
+import sys
+from pathlib import Path
+
+# Absolute paths captured at CMake configure time.
+_BUILTIN_DLL_DIRS = [
+    r\"@_FSI_VCPKG_BIN_DIR@\",
+    r\"@_FSI_CUDA_BIN_DIR@\",
+]
+
+if sys.platform == \"win32\" and hasattr(os, \"add_dll_directory\"):
+    _registered = set()
+
+    def _add(path):
+        if path and os.path.isdir(path) and path not in _registered:
+            try:
+                os.add_dll_directory(path)
+                _registered.add(path)
+            except OSError:
+                pass
+
+    # 1) Paths baked in at CMake configure time.
+    for _p in _BUILTIN_DLL_DIRS:
+        _add(_p)
+
+    # 2) Fallback: CUDA_PATH environment variable.
+    _cuda_path = os.environ.get(\"CUDA_PATH\")
+    if _cuda_path:
+        _add(os.path.join(_cuda_path, \"bin\"))
+
+    # 3) Fallback: walk upward from this file to locate vcpkg_installed.
+    _here = Path(__file__).resolve().parent
+    for _parent in [_here, *_here.parents]:
+        _candidate = _parent / \"vcpkg_installed\" / \"x64-windows\" / \"bin\"
+        if _candidate.is_dir():
+            _add(str(_candidate))
+            break
+
+    # 4) User-supplied extra directories (os.pathsep separated).
+    for _p in os.environ.get(\"FSI_EXTRA_DLL_DIRS\", \"\").split(os.pathsep):
+        _add(_p)
+
+from .fsi_simulator import *  # noqa: E402,F401,F403
+")
+
+    configure_file(
+        "${CMAKE_CURRENT_BINARY_DIR}/__init__.py.in"
+        "${CMAKE_CURRENT_BINARY_DIR}/__init__.py"
+        @ONLY
+    )
+
     install(FILES "${CMAKE_CURRENT_BINARY_DIR}/__init__.py"
-            DESTINATION . # 和.so文件安装到同一个目录下
+            DESTINATION fsi_simulator # 和.so文件安装到同一个目录下
             COMPONENT python_module
     )
 
