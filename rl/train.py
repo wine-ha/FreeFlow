@@ -44,6 +44,37 @@ _mp_start_method = 'spawn' if sys.platform == 'win32' else 'forkserver'
 torch.multiprocessing.set_start_method(_mp_start_method, force=True)
 
 
+def _redirect_std_to_file(log_path):
+    """Redirect current process stdout/stderr to log_path (append, line-buffered).
+
+    Needed on Windows because spawned worker processes do NOT inherit the
+    parent's shell redirection (cmd.exe `> file 2>&1`). Each worker must
+    explicitly reopen stdout/stderr itself so its prints go into the log file.
+    """
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(log_path)), exist_ok=True)
+    except Exception:
+        pass
+    # buffering=1 -> line buffered in text mode
+    f = open(log_path, 'a', buffering=1, encoding='utf-8', errors='replace')
+    sys.stdout = f
+    sys.stderr = f
+
+
+def _worker_entry(log_path, idx, sac_trainer, Env, cfg_path, rewards_queue,
+                  reward_buffer, replay_buffer, max_episodes, max_steps,
+                  batch_size, update_itr, explore_steps, action_dim,
+                  AUTO_ENTROPY, DETERMINISTIC, out_dir):
+    """Worker process entry: first redirect stdio, then run sac_worker."""
+    if log_path:
+        _redirect_std_to_file(log_path)
+        print(f"[worker pid={os.getpid()} gpu={idx}] stdio redirected to {log_path}",
+              flush=True)
+    sac_worker(idx, sac_trainer, Env, cfg_path, rewards_queue, reward_buffer,
+               replay_buffer, max_episodes, max_steps, batch_size, update_itr,
+               explore_steps, action_dim, AUTO_ENTROPY, DETERMINISTIC, out_dir)
+
+
 def arg_parser():
     parser = argparse.ArgumentParser(
         description='Train or test neural net motor controller.')
@@ -55,6 +86,10 @@ def arg_parser():
     parser.add_argument('--checkpoint', dest='checkpoint',
                         action='store_true', default=False)
     parser.add_argument('--cfg_path', type=str, default='./config.json')
+    parser.add_argument('--log_file', type=str, default=None,
+                        help='If set, redirect main and worker stdout/stderr '
+                             'to this file (append mode). Works around '
+                             'Windows spawn not inheriting shell redirects.')
 
     return parser.parse_args()
 
@@ -69,6 +104,10 @@ def plot(rewards, path):
 
 def main():
     args = arg_parser()
+    if args.log_file:
+        _redirect_std_to_file(args.log_file)
+        print(f"[main pid={os.getpid()}] stdio redirected to {args.log_file}",
+              flush=True)
     cfg_path = args.cfg_path
     cfg = json.load(open(cfg_path, 'r'))
     model_name = cfg["model_name"]
@@ -146,7 +185,8 @@ def main():
 
         for i in range(num_workers):
             idx = int(gpu_list[i])
-            process = Process(target=sac_worker, args=(
+            process = Process(target=_worker_entry, args=(
+                args.log_file,
                 idx, sac_trainer, Env, cfg_path, rewards_queue, reward_buffer, replay_buffer, max_episodes, max_steps,
                 batch_size, update_itr, explore_steps, action_dim, AUTO_ENTROPY, DETERMINISTIC, out_dir))  # the args contain shared and not shared
             process.daemon = True  # all processes closed when the main stops
