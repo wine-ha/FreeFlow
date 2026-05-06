@@ -41,3 +41,5 @@ build/
 *.vtk
 output/*
 *__pycache__/
+
+plan.md
