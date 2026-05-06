@@ -239,6 +239,9 @@ def main():
                              "Default: 5 levels spanning the estimated range.")
     parser.add_argument("--stream-points", type=int, default=200,
                         help="Number of seed points for streamlines")
+    parser.add_argument("--iso-opacity", type=float, default=0.7,
+                        help="Opacity of iso-surfaces (0=transparent, 1=opaque). "
+                             "Only used when --mode=isosurface.")
     parser.add_argument("--opacity", default="sigmoid",
                         help="Opacity transfer function for volume rendering "
                              "(pyvista preset name or single float)")
@@ -343,7 +346,7 @@ def main():
         if geom0 is not None and geom0.n_points > 0:
             a = plotter.add_mesh(
                 geom0, scalars="vmag", cmap=args.cmap, clim=(vmin, vmax),
-                opacity=0.35, smooth_shading=True,
+                opacity=args.iso_opacity, smooth_shading=True,
                 scalar_bar_args={"title": "|velocity|", "n_labels": 4},
             )
             fluid_actors.append(a)
@@ -399,7 +402,7 @@ def main():
                     if args.mode == "isosurface":
                         a = plotter.add_mesh(
                             geom, scalars="vmag", cmap=args.cmap,
-                            clim=(vmin, vmax), opacity=0.35,
+                            clim=(vmin, vmax), opacity=args.iso_opacity,
                             smooth_shading=True,
                             show_scalar_bar=False,
                         )
