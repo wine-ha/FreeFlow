@@ -33,12 +33,114 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import re
+
 import yaml
 
 # Fields in ``task.json["dreamer"]`` that intentionally have no counterpart
 # in Dreamer V3. They are accepted (so existing task.json keeps working) but
 # warnings are printed so nobody gets confused.
 _V2_ONLY_IGNORED = {"kl_balance", "kl_scale", "obs_norm", "slow_critic_update"}
+
+
+# ---------------------------------------------------------------- YAML loader
+# PyYAML (YAML 1.1) does NOT recognise bare scientific literals like ``1e-5``
+# or ``3e-5`` as floats -- the YAML 1.1 float token requires a decimal point
+# (``1.0e-5``). DIFF-LBM-RIGID's ``configs.yaml`` is written for YAML 1.2
+# style (``lr: 3e-5``), which ``ruamel.yaml`` parses correctly but PyYAML's
+# ``safe_load`` leaves as *strings*. Downstream (e.g. ``torch.optim.Adam``)
+# then crashes with ``'<=' not supported between instances of 'float' and
+# 'str'``.
+#
+# We fix this with a local SafeLoader subclass that installs a YAML 1.2
+# compatible float resolver. Nothing outside this module sees the custom
+# loader; DIFF-LBM-RIGID keeps its own YAML handling (it uses ruamel.yaml
+# itself for its own entry point).
+_YAML12_FLOAT_RE = re.compile(
+    r"""^[-+]?(?:
+        (?:\.[0-9]+ | [0-9]+(?:\.[0-9]*)?)(?:[eE][-+]?[0-9]+)?
+        | \.[iI][nN][fF] | \.[nN][aA][nN]
+    )$""",
+    re.VERBOSE,
+)
+
+
+class _FloatAwareSafeLoader(yaml.SafeLoader):
+    """SafeLoader that recognises ``1e-5`` / ``3e-5`` / ``1e6`` as floats.
+
+    The base ``yaml.SafeLoader`` only matches YAML 1.1 float tokens; bare
+    scientific-notation literals without a decimal point are treated as
+    strings. We replace the float resolver with a YAML-1.2-style regex so
+    ``configs.yaml`` numeric fields round-trip as Python ``float``.
+    """
+
+
+# Replace the float resolver tag 'tag:yaml.org,2002:float' on our loader.
+_FloatAwareSafeLoader.yaml_implicit_resolvers = {
+    k: [(tag, regexp) for tag, regexp in v if tag != "tag:yaml.org,2002:float"]
+    for k, v in yaml.SafeLoader.yaml_implicit_resolvers.items()
+}
+_FloatAwareSafeLoader.add_implicit_resolver(
+    "tag:yaml.org,2002:float",
+    _YAML12_FLOAT_RE,
+    list("-+0123456789."),
+)
+
+
+# Names of configs.yaml fields that are *definitely* numeric. If PyYAML
+# (even with the patched resolver above) somehow leaves them as strings,
+# ``_coerce_numeric_strings`` will force them back to float/int.
+_NUMERIC_FIELDS_TOP = {
+    "steps", "eval_every", "log_every", "prefill", "pretrain",
+    "train_ratio", "dataset_size", "grad_clip", "opt_eps",
+    "model_lr", "weight_decay", "unimix_ratio",
+    "discount", "discount_lambda", "kl_free",
+    "dyn_scale", "rep_scale", "dyn_min_std",
+    "reward_EMA", "batch_size", "batch_length",
+    "time_limit", "action_repeat", "envs", "eval_episode_num",
+    "imag_horizon", "imag_gradient_mix",
+    "expl_until", "expl_extr_scale", "expl_intr_scale",
+    "ou_theta", "ou_sigma", "ou_dt",
+}
+# Numeric sub-keys inside nested head/module dicts.
+_NUMERIC_FIELDS_NESTED = {
+    "lr", "eps", "loss_scale", "entropy", "outscale",
+    "min_std", "max_std", "temp", "unimix_ratio",
+    "grad_clip", "slow_target_update", "slow_target_fraction",
+    "cnn_depth", "kernel_size", "minres",
+    "mlp_layers", "mlp_units", "layers",
+}
+
+
+def _try_number(v):
+    """Return ``int`` or ``float`` for numeric-looking strings, else ``v``."""
+    if not isinstance(v, str):
+        return v
+    s = v.strip()
+    if not s or not _YAML12_FLOAT_RE.match(s):
+        return v
+    try:
+        if any(c in s for c in ".eE") or s.lower() in (".inf", "-.inf", ".nan"):
+            return float(s)
+        return int(s)
+    except ValueError:
+        return v
+
+
+def _coerce_numeric_strings(cfg: dict) -> dict:
+    """Post-pass: force known-numeric fields back to float/int if they ended
+    up as strings after YAML parsing (e.g. ``"1e-5"`` -> ``1e-5``).
+
+    Operates in-place on ``cfg`` (a dict) and also returns it.
+    """
+    for k, v in list(cfg.items()):
+        if isinstance(v, dict):
+            for sk, sv in list(v.items()):
+                if sk in _NUMERIC_FIELDS_NESTED:
+                    v[sk] = _try_number(sv)
+        elif k in _NUMERIC_FIELDS_TOP:
+            cfg[k] = _try_number(v)
+    return cfg
 
 
 def _flat_mapping(dreamer_cfg: dict, max_steps: int) -> dict:
@@ -138,7 +240,7 @@ def load_defaults(
     """
     cfg_path = Path(dreamer_repo) / "configs.yaml"
     with open(cfg_path, "r", encoding="utf-8") as f:
-        sections = yaml.safe_load(f)
+        sections = yaml.load(f, Loader=_FloatAwareSafeLoader)
     if "defaults" not in sections:
         raise RuntimeError(f"{cfg_path} does not contain a 'defaults:' section")
     merged = copy.deepcopy(sections["defaults"])
@@ -159,6 +261,9 @@ def load_defaults(
                 merged[k] = {**merged[k], **v}
             else:
                 merged[k] = v
+    # Belt-and-suspenders: even if the custom loader missed an edge case,
+    # force known-numeric fields back to numbers.
+    _coerce_numeric_strings(merged)
     return merged
 
 
@@ -248,6 +353,10 @@ def build_dreamer_config(
     # -- 4. extra CLI overrides (last wins) --
     all_overrides = {**env_overrides, **hp_overrides, **(extra_overrides or {})}
     merged = _apply_overrides(base, all_overrides)
+
+    # Final numeric coerce: catches anything an override introduced as a
+    # string (e.g. ``--extra lr=1e-5`` going through bad parsing paths).
+    _coerce_numeric_strings(merged)
 
     # -- 5. stash FreeFlow-only breadcrumbs for make_freeflow_vec_env --
     merged["freeflow_cfg_path"] = str(task_json_path)

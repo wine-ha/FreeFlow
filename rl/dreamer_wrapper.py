@@ -267,6 +267,25 @@ class FreeFlowDreamerVecEnv:
                 pass
 
 
+# ------------------------------------------------------------------ singleton
+# ``fsi_simulator`` (the C++ backend used by env.py) registers a global
+# ``FSI_SIM`` spdlog logger on ``Config2D/Config3D.load(...)``. Instantiating
+# a second env in the same process therefore raises
+# ``RuntimeError: logger with name 'FSI_SIM' already exists``.
+#
+# Dreamer's ``main()`` calls ``make_vec_env(config)`` twice at startup
+# (train_env + eval_env) and again after prefill/eval. To keep the
+# monkey-patch working without touching either FreeFlow's env.py or
+# DIFF-LBM-RIGID's dreamer.py, we cache the FreeFlowDreamerVecEnv per
+# (cfg_path, nworld) and reuse it for every subsequent call.
+_FREEFLOW_ENV_CACHE: dict[tuple[str, int], "FreeFlowDreamerVecEnv"] = {}
+
+
+def _reset_freeflow_env_cache() -> None:
+    """Drop the process-level env cache (mainly for tests / re-entrancy)."""
+    _FREEFLOW_ENV_CACHE.clear()
+
+
 def make_freeflow_vec_env(config):
     """Drop-in replacement for ``dreamer.make_vec_env`` when training on FreeFlow.
 
@@ -277,6 +296,12 @@ def make_freeflow_vec_env(config):
 
     Returns a ``DreamerVecEnvWrapper`` wrapping ``FreeFlowDreamerVecEnv``,
     which is exactly what ``dreamer.main`` expects ``make_vec_env`` to return.
+
+    Note: the underlying ``FreeFlowDreamerVecEnv`` is memoized per
+    ``(cfg_path, nworld)`` (see module-level comment on FSI_SIM logger).
+    Each call still returns a fresh ``DreamerVecEnvWrapper`` around the
+    shared env, which matches Dreamer's usage pattern (eval_env and
+    train_env are interacted with strictly serially via ``simulate_vec``).
     """
     # Import lazily so that merely importing this module does not require
     # DIFF-LBM-RIGID on sys.path.
@@ -288,13 +313,35 @@ def make_freeflow_vec_env(config):
             "config.freeflow_cfg_path is not set; train_dreamer.py must attach it "
             "before calling main(config)."
         )
+    cfg_path = str(Path(cfg_path).resolve())
+    nworld = int(getattr(config, "envs", 1))
 
-    env = FreeFlowDreamerVecEnv(
-        cfg_path=cfg_path,
-        nworld=int(getattr(config, "envs", 1)),
-        max_episode_steps=int(getattr(config, "time_limit", 0)) or None,
-    )
+    key = (cfg_path, nworld)
+    env = _FREEFLOW_ENV_CACHE.get(key)
+    if env is None:
+        env = FreeFlowDreamerVecEnv(
+            cfg_path=cfg_path,
+            nworld=nworld,
+            max_episode_steps=int(getattr(config, "time_limit", 0)) or None,
+        )
+        _FREEFLOW_ENV_CACHE[key] = env
+    else:
+        # Re-entrant call (e.g. eval_env, or after prefill when dreamer.main
+        # rebuilds train_env). Reset state but keep the C++ simulator alive.
+        try:
+            env.reset()
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"[make_freeflow_vec_env] cached env reset failed: {exc!r}; "
+                "continuing anyway.",
+                flush=True,
+            )
+
     return DreamerVecEnvWrapper(env, obs_key="vector")
 
 
-__all__ = ["FreeFlowDreamerVecEnv", "make_freeflow_vec_env"]
+__all__ = [
+    "FreeFlowDreamerVecEnv",
+    "make_freeflow_vec_env",
+    "_reset_freeflow_env_cache",
+]
