@@ -84,7 +84,19 @@ class FreeFlowDreamerVecEnv:
             )
         env_cls = env_cls_map[env_type]
 
-        self._env = env_cls(cfg_path)
+        # env.py resolves several paths (e.g. ``config_template_path``) relative
+        # to the current working directory. SAC's entrypoints happen to run
+        # from ``rl/``, but Dreamer / our test harness may be launched from the
+        # project root. Temporarily chdir to the directory containing cfg_path
+        # so those relative paths resolve the same way as under SAC.
+        cfg_dir = str(Path(cfg_path).resolve().parent)
+        _prev_cwd = os.getcwd()
+        try:
+            os.chdir(cfg_dir)
+            self._env = env_cls(cfg_path)
+        finally:
+            os.chdir(_prev_cwd)
+
         self._cfg = cfg
         self._cfg_path = cfg_path
 
