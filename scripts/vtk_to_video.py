@@ -191,6 +191,58 @@ def make_isosurface(fluid_mesh, levels):
         return None
 
 
+def _add_iso_dual(plotter, fluid_mesh, levels, vmin, vmax,
+                  low_color, high_color, low_alpha, high_alpha):
+    """Render iso-shells in the airy "dual-colour" style (see reference fig.).
+
+    Each level is extracted as its own surface and added as a separate actor
+    so we can give it an individual colour and opacity.
+
+    * Low |v| (outer, calm flow) -> ``low_color``  (light blue)
+    * High |v| (turbulent core)  -> ``high_color`` (warm red/orange)
+
+    A smooth interpolation between the two colours is used along the level
+    list so transitional shells get a blended hue.
+    """
+    if "vmag" not in fluid_mesh.array_names:
+        return []
+
+    def _hex_to_rgb(c):
+        if isinstance(c, (tuple, list)) and len(c) == 3:
+            return tuple(float(x) for x in c)
+        c = c.lstrip("#")
+        return (int(c[0:2], 16) / 255.0,
+                int(c[2:4], 16) / 255.0,
+                int(c[4:6], 16) / 255.0)
+
+    lo_rgb = np.array(_hex_to_rgb(low_color))
+    hi_rgb = np.array(_hex_to_rgb(high_color))
+
+    actors = []
+    span = max(vmax - vmin, 1e-12)
+    for lv in levels:
+        # 0 -> low, 1 -> high (clamped)
+        t = float(np.clip((lv - vmin) / span, 0.0, 1.0))
+        color = tuple((1.0 - t) * lo_rgb + t * hi_rgb)
+        alpha = (1.0 - t) * low_alpha + t * high_alpha
+
+        try:
+            shell = fluid_mesh.contour(isosurfaces=[lv], scalars="vmag")
+        except Exception as e:
+            print(f"[WARN] iso level {lv:.4g} failed: {e}")
+            continue
+        if shell is None or shell.n_points == 0:
+            continue
+        a = plotter.add_mesh(
+            shell, color=color, opacity=alpha,
+            smooth_shading=True,
+            ambient=0.35, diffuse=0.55, specular=0.05,
+            show_scalar_bar=False,
+        )
+        actors.append(a)
+    return actors
+
+
 def make_streamlines(fluid_mesh, solid_mesh, n_points=200, max_time=200.0):
     """Seed streamlines on a sphere around the swimmer centre."""
     if "velocity" not in fluid_mesh.array_names:
@@ -241,7 +293,39 @@ def main():
                         help="Number of seed points for streamlines")
     parser.add_argument("--iso-opacity", type=float, default=0.7,
                         help="Opacity of iso-surfaces (0=transparent, 1=opaque). "
-                             "Only used when --mode=isosurface.")
+                             "Only used when --mode=isosurface and --iso-style=cmap.")
+    parser.add_argument("--iso-style",
+                        choices=["cmap", "dual"], default="cmap",
+                        help="Iso-surface look. 'cmap' = colour each level by "
+                             "--cmap (legacy). 'dual' = low |v| in cool blue and "
+                             "high |v| (turbulent core) in warm red, with very "
+                             "low opacity (the airy nested-shells look).")
+    parser.add_argument("--iso-low-color", default="#7aa6d6",
+                        help="Colour for low-|v| iso-shells in --iso-style=dual.")
+    parser.add_argument("--iso-high-color", default="#c95643",
+                        help="Colour for high-|v| iso-shells (turbulent core) "
+                             "in --iso-style=dual.")
+    parser.add_argument("--iso-low-opacity", type=float, default=0.12,
+                        help="Opacity for the outer (low |v|) shells in dual style.")
+    parser.add_argument("--iso-high-opacity", type=float, default=0.35,
+                        help="Opacity for the inner (high |v|) shells in dual style.")
+    parser.add_argument("--split-turbulence", action="store_true",
+                        help="Render a split-screen video: top viewport shows "
+                             "the full dual iso-shells, bottom viewport shows "
+                             "only the high-|v| (turbulent core) shells. Only "
+                             "available with --mode isosurface --iso-style dual.")
+    parser.add_argument("--turb-frac", type=float, default=0.55,
+                        help="Fraction of [vmin, vmax] above which a shell is "
+                             "considered 'turbulent core' for the bottom "
+                             "viewport in --split-turbulence mode (default 0.55).")
+    parser.add_argument("--turb-opacity", type=float, default=0.45,
+                        help="Opacity used for the turbulent-core-only shells "
+                             "in the bottom viewport.")
+    parser.add_argument("--top-iso-count", type=int, default=2,
+                        help="How many shells to keep in the TOP viewport in "
+                             "--split-turbulence mode (default 2). They are "
+                             "sub-sampled evenly from the non-core levels so "
+                             "the top render stays sparse/airy.")
     parser.add_argument("--opacity", default="sigmoid",
                         help="Opacity transfer function for volume rendering "
                              "(pyvista preset name or single float)")
@@ -284,14 +368,38 @@ def main():
 
     # Default iso-levels if needed
     if args.mode == "isosurface" and args.iso_levels is None:
-        # skip the very bottom to avoid a level that fills the whole domain
-        args.iso_levels = list(np.linspace(vmin + 0.2 * (vmax - vmin),
-                                           vmax * 0.9, 5))
+        if args.iso_style == "dual":
+            # Few, well-spaced shells -- two outer (low |v|) + one or two inner
+            # (high |v|). Mimics the airy reference figure.
+            args.iso_levels = [
+                vmin + 0.20 * (vmax - vmin),
+                vmin + 0.40 * (vmax - vmin),
+                vmin + 0.65 * (vmax - vmin),
+                vmin + 0.85 * (vmax - vmin),
+            ]
+        else:
+            # Legacy: 5 levels with continuous cmap, skipping the very bottom.
+            args.iso_levels = list(np.linspace(vmin + 0.2 * (vmax - vmin),
+                                               vmax * 0.9, 5))
         print(f"[INFO] Auto iso-levels: {['%.4g' % v for v in args.iso_levels]}")
+
+    # Decide whether we run the split-screen pipeline.
+    use_split = (
+        args.split_turbulence
+        and args.mode == "isosurface"
+        and args.iso_style == "dual"
+    )
+    if args.split_turbulence and not use_split:
+        print("[WARN] --split-turbulence requires --mode isosurface --iso-style "
+              "dual. Falling back to single-viewport rendering.")
 
     # Set up off-screen plotter
     pv.OFF_SCREEN = True
-    plotter = pv.Plotter(off_screen=True, window_size=args.size)
+    if use_split:
+        plotter = pv.Plotter(off_screen=True, window_size=args.size,
+                             shape=(2, 1))
+    else:
+        plotter = pv.Plotter(off_screen=True, window_size=args.size)
     plotter.set_background(args.bg_color)
 
     # Initialise writer
@@ -308,11 +416,70 @@ def main():
     fluid0 = load_fluid(input_dir / f"fluid_frame_{first_id}.vtk")
     solid0 = load_solid(input_dir / f"solid_frame_{first_id}.vtk")
 
-    # Bounding box outline of the fluid domain for spatial reference
-    plotter.add_mesh(fluid0.outline(), color="gray", line_width=1)
+    if use_split:
+        # Top: outer flow only (no turbulent core).
+        # Bottom: turbulent core only.
+        plotter.subplot(0, 0)
+        plotter.set_background(args.bg_color)
+        plotter.add_mesh(fluid0.outline(), color="gray", line_width=1)
+        plotter.add_text("Flow field (no turbulent core)",
+                         position="upper_edge",
+                         font_size=10, color="black", name="title_top")
 
-    fluid_actors = []   # list so we can replace per-frame
+        plotter.subplot(1, 0)
+        plotter.set_background(args.bg_color)
+        plotter.add_mesh(fluid0.outline(), color="gray", line_width=1)
+        plotter.add_text("Turbulent core only", position="upper_edge",
+                         font_size=10, color="black", name="title_bot")
+
+        # Sync cameras between the two viewports.
+        plotter.link_views()
+        plotter.subplot(0, 0)
+    else:
+        # Bounding box outline of the fluid domain for spatial reference
+        plotter.add_mesh(fluid0.outline(), color="gray", line_width=1)
+
+    fluid_actors = []        # actors for the (top) full view
+    fluid_actors_bot = []    # actors only for the bottom (core-only) view
     volume_actor = None
+
+    # Pre-compute which iso levels belong to the "turbulent core" subset and
+    # which belong to the outer (non-core) flow.
+    if use_split:
+        span_lvl = max(vmax - vmin, 1e-12)
+        core_levels = [lv for lv in args.iso_levels
+                       if (lv - vmin) / span_lvl >= args.turb_frac]
+        non_core_levels = [lv for lv in args.iso_levels
+                           if (lv - vmin) / span_lvl < args.turb_frac]
+        if not core_levels:
+            # Fall back to the highest level so the bottom viewport is not empty.
+            core_levels = [max(args.iso_levels)]
+        if not non_core_levels:
+            # If user picked turb_frac so low that nothing is left, keep the
+            # very lowest level so the top viewport is not empty.
+            non_core_levels = [min(args.iso_levels)]
+
+        # Make the TOP viewport sparser by keeping only `--top-iso-count`
+        # shells, evenly sub-sampled from the non-core set.
+        top_levels = non_core_levels
+        if args.top_iso_count is not None and args.top_iso_count > 0 \
+                and len(non_core_levels) > args.top_iso_count:
+            idx = np.linspace(0, len(non_core_levels) - 1,
+                              args.top_iso_count).round().astype(int)
+            # Deduplicate while preserving order
+            seen = set()
+            top_levels = []
+            for i in idx:
+                if i not in seen:
+                    seen.add(i)
+                    top_levels.append(non_core_levels[i])
+
+        print(f"[INFO] Outer (non-core) levels: "
+              f"{['%.4g' % v for v in non_core_levels]}")
+        print(f"[INFO] Top-viewport levels   : "
+              f"{['%.4g' % v for v in top_levels]}")
+        print(f"[INFO] Turbulent-core levels: "
+              f"{['%.4g' % v for v in core_levels]}")
 
     def _build_fluid_geometry(fluid, solid):
         """Compute the geometry to render for the fluid part at this frame."""
@@ -327,7 +494,36 @@ def main():
         return None  # "volume" handled separately
 
     # ---- initial actors for the fluid -----------------------------------
-    if args.mode == "volume":
+    if use_split:
+        # Top viewport = outer flow only (low-|v| shells, no turbulent core)
+        plotter.subplot(0, 0)
+        actors = _add_iso_dual(plotter, fluid0, top_levels, vmin, vmax,
+                               args.iso_low_color, args.iso_high_color,
+                               args.iso_low_opacity, args.iso_high_opacity)
+        fluid_actors.extend(actors)
+        solid_actor_top = plotter.add_mesh(
+            solid0, color=args.solid_color, smooth_shading=True,
+            show_edges=False,
+        )
+
+        # Bottom viewport = turbulent core only (single warm colour, denser)
+        plotter.subplot(1, 0)
+        actors_b = _add_iso_dual(plotter, fluid0, core_levels, vmin, vmax,
+                                 args.iso_high_color, args.iso_high_color,
+                                 args.turb_opacity, args.turb_opacity)
+        fluid_actors_bot.extend(actors_b)
+        solid_actor_bot = plotter.add_mesh(
+            solid0, color=args.solid_color, smooth_shading=True,
+            show_edges=False,
+        )
+
+        # Use the top viewport to set the shared camera.
+        plotter.subplot(0, 0)
+        plotter.camera_position = "iso"
+        plotter.reset_camera()
+        plotter.camera.zoom(1.1)
+
+    elif args.mode == "volume":
         # Volume rendering: needs ImageData with the scalar field
         volume_actor = plotter.add_volume(
             fluid0, scalars="vmag", cmap=args.cmap,
@@ -342,14 +538,20 @@ def main():
         )
         fluid_actors.append(a)
     elif args.mode == "isosurface":
-        geom0 = _build_fluid_geometry(fluid0, solid0)
-        if geom0 is not None and geom0.n_points > 0:
-            a = plotter.add_mesh(
-                geom0, scalars="vmag", cmap=args.cmap, clim=(vmin, vmax),
-                opacity=args.iso_opacity, smooth_shading=True,
-                scalar_bar_args={"title": "|velocity|", "n_labels": 4},
-            )
-            fluid_actors.append(a)
+        if args.iso_style == "dual":
+            actors = _add_iso_dual(plotter, fluid0, args.iso_levels, vmin, vmax,
+                                   args.iso_low_color, args.iso_high_color,
+                                   args.iso_low_opacity, args.iso_high_opacity)
+            fluid_actors.extend(actors)
+        else:
+            geom0 = _build_fluid_geometry(fluid0, solid0)
+            if geom0 is not None and geom0.n_points > 0:
+                a = plotter.add_mesh(
+                    geom0, scalars="vmag", cmap=args.cmap, clim=(vmin, vmax),
+                    opacity=args.iso_opacity, smooth_shading=True,
+                    scalar_bar_args={"title": "|velocity|", "n_labels": 4},
+                )
+                fluid_actors.append(a)
     elif args.mode == "streamlines":
         geom0 = _build_fluid_geometry(fluid0, solid0)
         if geom0 is not None and geom0.n_points > 0:
@@ -368,20 +570,64 @@ def main():
         )
         fluid_actors.append(a)
 
-    solid_actor = plotter.add_mesh(
-        solid0, color=args.solid_color, smooth_shading=True,
-        show_edges=False,
-    )
+    if not use_split:
+        solid_actor = plotter.add_mesh(
+            solid0, color=args.solid_color, smooth_shading=True,
+            show_edges=False,
+        )
 
-    # Fixed isometric camera
-    plotter.camera_position = "iso"
-    plotter.reset_camera()
-    plotter.camera.zoom(1.1)
+        # Fixed isometric camera
+        plotter.camera_position = "iso"
+        plotter.reset_camera()
+        plotter.camera.zoom(1.1)
 
     try:
         for step, fid in enumerate(frame_ids):
             fluid = load_fluid(input_dir / f"fluid_frame_{fid}.vtk")
             solid = load_solid(input_dir / f"solid_frame_{fid}.vtk")
+
+            # --- split-screen path: rebuild both viewports --------------
+            if use_split:
+                # Top viewport (outer flow only)
+                plotter.subplot(0, 0)
+                for a in fluid_actors:
+                    plotter.remove_actor(a, render=False)
+                fluid_actors.clear()
+                actors = _add_iso_dual(
+                    plotter, fluid, top_levels, vmin, vmax,
+                    args.iso_low_color, args.iso_high_color,
+                    args.iso_low_opacity, args.iso_high_opacity,
+                )
+                fluid_actors.extend(actors)
+                solid_actor_top.mapper.SetInputData(solid)
+
+                # Bottom viewport
+                plotter.subplot(1, 0)
+                for a in fluid_actors_bot:
+                    plotter.remove_actor(a, render=False)
+                fluid_actors_bot.clear()
+                actors_b = _add_iso_dual(
+                    plotter, fluid, core_levels, vmin, vmax,
+                    args.iso_high_color, args.iso_high_color,
+                    args.turb_opacity, args.turb_opacity,
+                )
+                fluid_actors_bot.extend(actors_b)
+                solid_actor_bot.mapper.SetInputData(solid)
+
+                # Frame label on the top viewport only
+                plotter.subplot(0, 0)
+                plotter.add_text(
+                    f"frame {fid}", name="frame_label",
+                    position="upper_left", font_size=10, color="black",
+                )
+
+                plotter.render()
+                img = plotter.screenshot(return_img=True)
+                writer.append_data(img)
+
+                if (step + 1) % 10 == 0 or step + 1 == len(frame_ids):
+                    print(f"[INFO]   rendered {step + 1}/{len(frame_ids)}")
+                continue
 
             # --- update fluid visualization -----------------------------
             if args.mode == "volume":
@@ -397,7 +643,17 @@ def main():
                     plotter.remove_actor(a, render=False)
                 fluid_actors.clear()
 
-                geom = _build_fluid_geometry(fluid, solid)
+                if args.mode == "isosurface" and args.iso_style == "dual":
+                    # Build & add one actor per shell, with custom colour/alpha.
+                    actors = _add_iso_dual(
+                        plotter, fluid, args.iso_levels, vmin, vmax,
+                        args.iso_low_color, args.iso_high_color,
+                        args.iso_low_opacity, args.iso_high_opacity,
+                    )
+                    fluid_actors.extend(actors)
+                    geom = None  # already handled
+                else:
+                    geom = _build_fluid_geometry(fluid, solid)
                 if geom is not None and getattr(geom, "n_points", 1) > 0:
                     if args.mode == "isosurface":
                         a = plotter.add_mesh(

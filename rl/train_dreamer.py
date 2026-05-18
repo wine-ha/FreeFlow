@@ -122,6 +122,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "prefill=0, steps=0) then exit. Used as the phase-1 smoke test.",
     )
     parser.add_argument(
+        "--test",
+        action="store_true",
+        help="Load a trained Dreamer checkpoint and roll out deterministic "
+             "episodes, calling env.render() each step so that VTK frames "
+             "get written under output/<exp>/<model>/render_data/. Use "
+             "scripts/vtk_to_video.py afterwards to make an mp4.",
+    )
+    parser.add_argument("--test_steps", type=int, default=0,
+                        help="[--test only] Per-episode step budget. "
+                             "Default 0 = use total_time/interval from cfg.")
+    parser.add_argument("--test_episodes", type=int, default=1,
+                        help="[--test only] Number of test episodes to run.")
+    parser.add_argument("--ignore_done", action="store_true", default=False,
+                        help="[--test only] Do not stop on done=1 (success). "
+                             "done=2 (divergence) still stops the rollout.")
+    parser.add_argument("--checkpoint", type=str, default="latest.pt",
+                        help="[--test only] Checkpoint filename (relative to "
+                             "logdir) or an absolute path. Default: latest.pt")
+    parser.add_argument(
         "--extra",
         nargs="*",
         default=[],
@@ -197,6 +216,9 @@ def main(argv: list[str] | None = None) -> None:
     _maybe("checkpoint_every", args.checkpoint_every)
     _maybe("compile",         args.compile)
 
+    if args.dry_run and args.test:
+        raise SystemExit("--dry_run and --test are mutually exclusive.")
+
     if args.dry_run:
         # A dry run needs: no prefill, no training loop, no eval.
         # ``dreamer.main`` loops while ``agent._step < steps + eval_every``.
@@ -209,6 +231,19 @@ def main(argv: list[str] | None = None) -> None:
         extra_overrides.setdefault("log_every", 1)
         extra_overrides.setdefault("video_pred_log", False)
         extra_overrides.setdefault("compile", False)
+
+    if args.test:
+        # --test builds the agent manually (no dreamer.main loop), but still
+        # goes through build_dreamer_config so encoder/actor/etc dims match
+        # what was trained. Kill all training-side side effects.
+        extra_overrides.setdefault("steps", 0)
+        extra_overrides.setdefault("prefill", 0)
+        extra_overrides.setdefault("eval_every", 0)
+        extra_overrides.setdefault("eval_episode_num", 0)
+        extra_overrides.setdefault("log_every", 1)
+        extra_overrides.setdefault("video_pred_log", False)
+        extra_overrides.setdefault("compile", False)
+        extra_overrides.setdefault("envs", 1)
 
     # --- build config namespace ---
     ns = build_dreamer_config(
@@ -238,9 +273,166 @@ def main(argv: list[str] | None = None) -> None:
     print(f"  imag_horizon = {ns.imag_horizon}  "
           f"discount = {ns.discount}")
     print(f"  dry_run      = {args.dry_run}")
+    print(f"  test         = {args.test}")
     print("=" * 70)
 
+    if args.test:
+        _run_test(ns, args)
+        return
+
     dreamer_mod.main(ns)
+
+
+def _run_test(ns, args) -> None:
+    """Deterministic Dreamer rollout with VTK frame dumping.
+
+    Manually wires up what ``dreamer.main`` normally does (make_vec_env +
+    Dreamer + load latest.pt), but drives the env in a plain Python loop so
+    we can call ``env.render()`` every step. This is the Dreamer analogue of
+    ``train.py --test`` for SAC.
+    """
+    import time
+    from pathlib import Path as _Path
+
+    import numpy as np
+    import torch
+
+    # Late imports: these require sys.path to already include the dreamer repo,
+    # which main() has set up by the time _run_test is called.
+    import dreamer as dreamer_mod  # noqa: F401 (forces import side effects)
+    from dreamer import Dreamer
+    from dreamer_wrapper import make_freeflow_vec_env
+
+    logdir = _Path(ns.logdir).resolve()
+    ckpt_arg = _Path(args.checkpoint)
+    ckpt_path = ckpt_arg if ckpt_arg.is_absolute() else (logdir / ckpt_arg)
+    if not ckpt_path.is_file():
+        raise FileNotFoundError(
+            f"Dreamer checkpoint not found: {ckpt_path}\n"
+            f"  Did training save to a different --logdir?"
+        )
+
+    # Build the vectorized env (nworld=1). This is the same path training uses,
+    # so the underlying FreeFlow LBSEnv is created exactly once.
+    vec = make_freeflow_vec_env(ns)
+    ff_vec = vec._env                 # FreeFlowDreamerVecEnv
+    base_env = ff_vec._env            # LBSEnv (has .render(), .data_dir)
+    render_dir = _Path(base_env.data_dir) / "render_data"
+
+    # dreamer.main() stamps this onto config right after building envs, and
+    # WorldModel / Dreamer._policy read it directly. Replicate the same step
+    # here so our manual agent construction matches training-time wiring.
+    ns.num_actions = vec.action_space.shape[0]
+
+    # Build Dreamer agent. ``training=False`` disables the replay loop, but
+    # Dreamer.__init__ still needs a dataset iterator shape-compatibly; we can
+    # safely pass an empty OrderedDict-backed generator because _train won't
+    # be called in eval mode.
+    import collections
+    empty_eps = collections.OrderedDict()
+    # Minimal logger that Dreamer.__init__ only uses for .step.
+    import tools as dreamer_tools  # noqa: F401
+    logger = dreamer_tools.Logger(logdir, 0)
+
+    # make_dataset needs at least shape metadata; easiest path: reuse dreamer's.
+    from dreamer import make_dataset
+    # make_dataset returns a generator; we won't iterate it in eval.
+    try:
+        dataset = make_dataset(empty_eps, ns)
+    except Exception:
+        dataset = None  # Dreamer's _policy path does not touch dataset.
+
+    agent = Dreamer(
+        obs_space=vec.observation_space,
+        act_space=vec.action_space,
+        config=ns,
+        logger=logger,
+        dataset=dataset,
+    ).to(ns.device)
+    agent.requires_grad_(False)
+
+    state_dict = torch.load(ckpt_path, map_location=ns.device)
+    agent.load_state_dict(state_dict["agent_state_dict"])
+    agent.eval()
+
+    # Episode length: CLI override wins, else cfg-derived.
+    cfg_max = int(ff_vec.max_episode_steps)
+    render_steps = int(args.test_steps) if args.test_steps > 0 else cfg_max
+    n_eps = max(1, int(args.test_episodes))
+
+    print(f"[test] checkpoint    = {ckpt_path}")
+    print(f"[test] render_steps  = {render_steps}")
+    print(f"[test] episodes      = {n_eps}")
+    print(f"[test] ignore_done   = {args.ignore_done}")
+    print(f"[test] render_dir    = {render_dir}")
+
+    for eps in range(n_eps):
+        obs_list = vec.reset()
+        # ``obs_list`` is a list[dict] of length num_envs; keys include 'vector',
+        # 'is_first', 'is_terminal'. agent() expects a stacked dict batch.
+        done = np.zeros(vec.num_envs, dtype=bool)
+        agent_state = None
+        ep_reward = 0.0
+        ep_energy = 0.0
+        t0 = time.time()
+
+        for step in range(render_steps):
+            obs_batch = {
+                k: np.stack([o[k] for o in obs_list])
+                for k in obs_list[0] if "log_" not in k
+            }
+            with torch.no_grad():
+                policy_out, agent_state = agent(
+                    obs_batch, done, agent_state, training=False,
+                )
+            action = policy_out["action"]
+            if hasattr(action, "detach"):
+                action_np = action.detach().cpu().numpy()
+            else:
+                action_np = np.asarray(action)
+
+            obs_list, rewards, dones, infos = vec.step(action_np)
+
+            # Write a VTK frame for this transition.
+            base_env.render()
+
+            # Unwrap per-env scalars (num_envs=1 here).
+            ep_reward += float(infos[0].get("fish_vel_towards_target",
+                                             rewards[0]))
+            ep_energy += float(infos[0].get("step_energy", 0.0))
+            done = np.asarray(dones)
+
+            # Periodic progress print so the console doesn't look frozen.
+            if (step + 1) % 10 == 0 or step == 0:
+                elapsed = time.time() - t0
+                sps = (step + 1) / max(elapsed, 1e-6)
+                print(f"[test] ep={eps} step={step + 1}/{render_steps}  "
+                      f"return={ep_reward:.4f}  "
+                      f"elapsed={elapsed:.1f}s  ({sps:.2f} step/s)",
+                      flush=True)
+
+            term_reason = infos[0].get("term_reason", None)
+            if bool(infos[0].get("terminated", False)):
+                if term_reason == "diverged" or \
+                   (isinstance(term_reason, list) and "diverged" in term_reason):
+                    print(f"[test] ep={eps} step={step}: diverged, stop.",
+                          flush=True)
+                    break
+                if not args.ignore_done:
+                    print(f"[test] ep={eps} step={step}: terminated "
+                          f"({term_reason}), stop (pass --ignore_done to "
+                          f"keep rendering).", flush=True)
+                    break
+
+        dt = time.time() - t0
+        print(f"[test] ep={eps}  steps={step + 1}  "
+              f"return={ep_reward:.4f}  energy={ep_energy:.4f}  "
+              f"wallclock={dt:.1f}s")
+
+    print(f"[test] done. VTK frames -> {render_dir}")
+    print(f"[test] make a video with:")
+    print(f"  python scripts/vtk_to_video.py --input \"{render_dir}\" "
+          f"--output \"{render_dir.parent / 'dreamer_test.mp4'}\"")
 
 
 if __name__ == "__main__":
