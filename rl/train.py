@@ -25,6 +25,8 @@
 import numpy as np
 import os
 import json
+import time
+import datetime
 from pathlib import Path
 import matplotlib.pyplot as plt
 import argparse
@@ -100,6 +102,14 @@ def plot(rewards, path):
     plt.savefig(path)
     # plt.show()
     plt.close()
+
+
+def _fmt_hms(seconds: float) -> str:
+    """Format a wallclock duration in seconds as ``HH:MM:SS``."""
+    seconds = int(max(0.0, float(seconds)))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
 
 
 def main():
@@ -193,16 +203,94 @@ def main():
             processes.append(process)
 
         [p.start() for p in processes]
+
+        # Per-step env counter so metrics.jsonl uses the same kind of
+        # monotonically-increasing "step" axis as Dreamer's metrics.jsonl.
+        # We don't have access to per-env-step granularity here (workers
+        # only report at episode boundaries), so we accumulate episode
+        # lengths in the main process.
+        env_step = 0
+        episode_count = 0
+        metrics_path = os.path.join(out_dir, "metrics.jsonl")
+        # Truncate jsonl on a fresh run; append on --checkpoint resume.
+        if not args.checkpoint and os.path.isfile(metrics_path):
+            try:
+                os.remove(metrics_path)
+            except OSError:
+                pass
+
+        # Wallclock baseline. Used to stamp every metrics.jsonl line so
+        # SAC/Dreamer curves can be aligned on either env-step or wallclock.
+        train_start_t = time.time()
+        train_start_iso = datetime.datetime.now().isoformat(timespec="seconds")
+        print(f"[train] training started at {train_start_iso}", flush=True)
+
         while True:  # keep geting the episode reward from the queue
             r = rewards_queue.get()
-            if r is not None:
-                if len(rewards) == 0:
-                    rewards.append(r)
-                else:
-                    # moving average of episode rewards
-                    rewards.append(0.9 * rewards[-1] + 0.1 * r)
-            else:
+            if r is None:
                 break
+
+            # Backward compat: workers may push a bare float instead of dict.
+            if isinstance(r, dict):
+                raw_return = float(r.get("return", 0.0))
+                ep_length = int(r.get("length", 0))
+                term_reason = str(r.get("term_reason", "truncated"))
+                worker_id = int(r.get("worker_id", -1))
+                ep_energy = float(r.get("energy", 0.0))
+            else:
+                raw_return = float(r)
+                ep_length = 0
+                term_reason = "unknown"
+                worker_id = -1
+                ep_energy = 0.0
+
+            if len(rewards) == 0:
+                rewards.append(raw_return)
+            else:
+                # moving average of episode rewards (kept for plot/.npy
+                # backward compatibility).
+                rewards.append(0.9 * rewards[-1] + 0.1 * raw_return)
+
+            episode_count += 1
+            env_step += ep_length
+
+            # Wallclock since training start (seconds), and ISO timestamp.
+            wallclock = time.time() - train_start_t
+            wallclock_iso = datetime.datetime.now().isoformat(
+                timespec="seconds")
+
+            # Append one line of Dreamer-style metrics per episode.
+            metrics_record = {
+                "step": env_step,
+                "wallclock": round(wallclock, 3),
+                "wallclock_str": _fmt_hms(wallclock),
+                "wallclock_iso": wallclock_iso,
+                "train_return": raw_return,
+                "ep_reward_mean": rewards[-1],
+                "train_length": ep_length,
+                "train_episodes": episode_count,
+                "term_reason": term_reason,
+                "worker_id": worker_id,
+                "episode_energy": ep_energy,
+            }
+            try:
+                with open(metrics_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(metrics_record) + "\n")
+            except OSError as e:
+                print(f"[train] failed to write metrics.jsonl: {e}",
+                      flush=True)
+
+            # Mirror Dreamer's `[step] k v / k v ...` console line so a
+            # `tail -f` on stdout looks similar across SAC and Dreamer.
+            print(
+                f"[{env_step}] elapsed {_fmt_hms(wallclock)} / "
+                f"train_return {raw_return:.3f} / "
+                f"ep_reward_mean {rewards[-1]:.3f} / "
+                f"train_length {ep_length} / "
+                f"train_episodes {episode_count} / "
+                f"reason {term_reason}",
+                flush=True,
+            )
 
             if len(rewards) % 10 == 0 and len(rewards) > 0:
                 plot(rewards, out_dir + '/rewards.png')

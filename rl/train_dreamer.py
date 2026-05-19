@@ -169,6 +169,44 @@ def _parse_extra_overrides(items: list[str]) -> dict:
     return out
 
 
+def _patch_logger_with_wallclock() -> None:
+    """Monkey-patch ``tools.Logger.write`` so every emitted record carries
+    ``wallclock`` (seconds since training start) and ``wallclock_str``
+    (``HH:MM:SS``).
+
+    This adds the field to BOTH the ``metrics.jsonl`` line and the
+    ``[step] k v / ...`` console print, since Dreamer's ``Logger.write``
+    builds them from the same ``self._scalars`` dict.
+    """
+    import time as _time
+    import tools as dreamer_tools  # late import; sys.path is set up by now
+
+    if getattr(dreamer_tools.Logger, "_freeflow_wallclock_patched", False):
+        return  # idempotent
+
+    _orig_write = dreamer_tools.Logger.write
+    train_start = _time.time()
+
+    def _fmt(seconds: float) -> str:
+        s = int(max(0.0, float(seconds)))
+        h, rem = divmod(s, 3600)
+        m, s = divmod(rem, 60)
+        return f"{h:02d}:{m:02d}:{s:02d}"
+
+    def write(self, fps=False, step=False):
+        elapsed = _time.time() - train_start
+        # Inject as scalars so they appear in both jsonl + console line.
+        self._scalars["wallclock"] = round(elapsed, 3)
+        # tools.Logger formats scalars with `{:.1f}`, so a string field
+        # would crash. Print the HH:MM:SS form ourselves before the
+        # original write() consumes the dict.
+        print(f"[wallclock] elapsed {_fmt(elapsed)}", flush=True)
+        return _orig_write(self, fps=fps, step=step)
+
+    dreamer_tools.Logger.write = write
+    dreamer_tools.Logger._freeflow_wallclock_patched = True
+
+
 # --- main -----------------------------------------------------------------
 
 def main(argv: list[str] | None = None) -> None:
@@ -257,6 +295,10 @@ def main(argv: list[str] | None = None) -> None:
 
     # --- monkey-patch make_vec_env -> FreeFlow wrapper ---
     dreamer_mod.make_vec_env = make_freeflow_vec_env
+
+    # --- monkey-patch tools.Logger.write to inject a wallclock field on
+    # every metrics.jsonl line / TB scalar (parity with SAC's train.py).
+    _patch_logger_with_wallclock()
 
     # --- launch Dreamer ---
     print("=" * 70)

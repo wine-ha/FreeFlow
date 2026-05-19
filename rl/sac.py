@@ -496,6 +496,8 @@ def sac_worker(id, sac_trainer, Env, cfg_path, rewards_queue, reward_buffer, rep
         state = env.reset()
         episode_reward = 0
         episode_energy = 0
+        episode_length = 0
+        term_reason = "truncated"
 
         for step in range(max_steps):
             if frame_idx > explore_steps:
@@ -519,15 +521,26 @@ def sac_worker(id, sac_trainer, Env, cfg_path, rewards_queue, reward_buffer, rep
             state = next_state
             episode_reward += reward
             frame_idx += 1
+            episode_length += 1
 
             if done:
-                # print("done.")
+                # done==1: success/reached target;  done==2: divergence/oob
+                term_reason = "reached" if done == 1 else "diverged"
                 break
 
         print('Worker: ', id, '| Episode: ', eps, '| Episode Reward: ',
               episode_reward, '| Episode Energy: ', episode_energy)
 
-        rewards_queue.put(episode_reward)
+        # Send a structured record so main process can write metrics.jsonl.
+        # Backward-compatible: main also accepts a bare float.
+        rewards_queue.put({
+            "worker_id": int(id),
+            "episode": int(eps),
+            "return": float(episode_reward),
+            "length": int(episode_length),
+            "energy": float(episode_energy),
+            "term_reason": term_reason,
+        })
 
         if eps % 5 == 0 and eps > 0:  # plot and model saving interval
             success = reward_buffer.update(episode_reward)
